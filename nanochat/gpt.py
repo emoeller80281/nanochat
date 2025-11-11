@@ -37,7 +37,6 @@ def norm(x):
     # Purely functional rmsnorm with no learnable params
     return F.rms_norm(x, (x.size(-1),))
 
-
 def apply_rotary_emb(x, cos, sin):
     assert x.ndim == 4  # multihead attention
     d = x.shape[3] // 2
@@ -56,14 +55,17 @@ class CausalSelfAttention(nn.Module):
         self.n_kv_head = config.n_kv_head
         self.n_embd = config.n_embd
         self.head_dim = self.n_embd // self.n_head
+        
         assert self.n_embd % self.n_head == 0
         assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
+        
         self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
         self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
 
     def forward(self, x, cos_sin, kv_cache):
+        # Batch, Tokens, Context(?)
         B, T, C = x.size()
 
         # Project the input to get queries, keys, and values
@@ -213,27 +215,34 @@ class GPT(nn.Module):
     def setup_optimizers(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
+        
         # Separate out all parameters into 3 groups (matrix, embedding, lm_head)
         matrix_params = list(self.transformer.h.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
+        
         assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params)
+        
         # Create the AdamW optimizer for the embedding and lm_head
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (having tuned the LRs for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         if rank == 0:
             print(f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}")
+            
         adam_groups = [
             dict(params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale),
             dict(params=embedding_params, lr=embedding_lr * dmodel_lr_scale),
         ]
+        
         adamw_kwargs = dict(betas=(0.8, 0.95), eps=1e-10, weight_decay=weight_decay)
         AdamWFactory = DistAdamW if ddp else partial(torch.optim.AdamW, fused=True)
         adamw_optimizer = AdamWFactory(adam_groups, **adamw_kwargs)
+        
         # Create the Muon optimizer for the linear layers
         muon_kwargs = dict(lr=matrix_lr, momentum=0.95)
         MuonFactory = DistMuon if ddp else Muon
         muon_optimizer = MuonFactory(matrix_params, **muon_kwargs)
+        
         # Combine them the two optimizers into one list
         optimizers = [adamw_optimizer, muon_optimizer]
         for opt in optimizers:
@@ -248,6 +257,7 @@ class GPT(nn.Module):
         assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
         assert idx.device == self.cos.device, f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
         assert self.cos.dtype == torch.bfloat16, "Rotary embeddings must be in bfloat16"
+        
         # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
         T0 = 0 if kv_cache is None else kv_cache.get_pos()
         cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
@@ -286,22 +296,28 @@ class GPT(nn.Module):
         assert isinstance(tokens, list)
         device = self.get_device()
         rng = None
+        
         if temperature > 0:
             rng = torch.Generator(device=device)
             rng.manual_seed(seed)
         ids = torch.tensor([tokens], dtype=torch.long, device=device) # add batch dim
+        
         for _ in range(max_tokens):
             logits = self.forward(ids) # (B, T, vocab_size)
             logits = logits[:, -1, :] # (B, vocab_size)
+            
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('Inf')
+                
             if temperature > 0:
                 logits = logits / temperature
                 probs = F.softmax(logits, dim=-1)
                 next_ids = torch.multinomial(probs, num_samples=1, generator=rng)
+                
             else:
                 next_ids = torch.argmax(logits, dim=-1, keepdim=True)
+                
             ids = torch.cat((ids, next_ids), dim=1)
             token = next_ids.item()
             yield token
