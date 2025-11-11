@@ -87,14 +87,16 @@ class KVCache:
 
     def __init__(self, batch_size, num_heads, seq_len, head_dim, num_layers):
         # Each of K/V is of shape (B, H, T, D) and we have one per layer of the Transformer.
-        self.kv_shape = (num_layers, 2, batch_size, num_heads, seq_len, head_dim)
+        self.kv_shape = (num_layers, 2, batch_size, num_heads, seq_len, head_dim)  # The "2" dimension is for Key vs Value
         self.kv_cache = None
         self.pos = 0 # current position in time in the cache
 
     def reset(self):
+        """Reset cache position to 0"""
         self.pos = 0
 
     def get_pos(self):
+        """Return the current cache position"""
         return self.pos
 
     def prefill(self, other):
@@ -116,39 +118,59 @@ class KVCache:
             elif ix == 4:
                 # seq_len: self must be longer than other
                 assert dim1 >= dim2, f"Seq len mismatch: {dim1} < {dim2}"
+                
         # 2) initialize the cache
         dtype, device = other.kv_cache.dtype, other.kv_cache.device
+        
+        # Create an empty tensor to store the cache, use the same device as the other cache
         self.kv_cache = torch.empty(self.kv_shape, dtype=dtype, device=device)
-        # 3) copy the data over
+        
+        # 3) copy the data over from the other cache, add to list of sequences
         self.kv_cache[:, :, :, :, :other.pos, :] = other.kv_cache
+        
         # 4) update the pos
         self.pos = other.pos
 
     def insert_kv(self, layer_idx, k, v):
+        """Adds KV pairs for a new sequence to the end of the KVCache"""
         # Lazy initialize the cache here because we need to know the dtype/device
         if self.kv_cache is None:
             self.kv_cache = torch.empty(self.kv_shape, dtype=k.dtype, device=k.device)
+            
         # Insert new keys/values to the cache and return the full cache so far
-        B, H, T_add, D = k.size()
+        B, H, T_add, D = k.size() # T_add is seq_len
+        
+        # Get the current position and the position with the new K added
         t0, t1 = self.pos, self.pos + T_add
+        
         # Dynamically grow the cache if needed
-        if t1 > self.kv_cache.size(4):
+        if t1 > self.kv_cache.size(4): # size(4) refers to the seq_length
+            
+            # Figure out how to grow the buffer
             t_needed = t1 + 1024 # as much as we need plus buffer of 1024
             t_needed = (t_needed + 1023) & ~1023 # then round up to the nearest multiple of 1024
+            
+            # Calculate how many items we need in the cache to match t_1 and initialize an empty tensor
             additional_shape = list(self.kv_cache.shape)
             additional_shape[4] = t_needed - self.kv_cache.size(4)
             additional_cache = torch.empty(additional_shape, dtype=k.dtype, device=k.device)
+            
+            # Add space for the new KV into the new one and reset the shape
             self.kv_cache = torch.cat([self.kv_cache, additional_cache], dim=4).contiguous()
             self.kv_shape = self.kv_cache.shape
+            
         # Insert k, v into the cache
-        self.kv_cache[layer_idx, 0, :, :, t0:t1] = k
-        self.kv_cache[layer_idx, 1, :, :, t0:t1] = v
+        self.kv_cache[layer_idx, 0, :, :, t0:t1] = k    # New keys for the sequences added to the end of the sequence list
+        self.kv_cache[layer_idx, 1, :, :, t0:t1] = v    # New values for the sequence added to the end of the sequence list
+        
         # Return the full cached keys/values up to current position (as a view)
         key_view = self.kv_cache[layer_idx, 0, :, :, :t1]
         value_view = self.kv_cache[layer_idx, 1, :, :, :t1]
+        
         # Increment pos after the last layer of the Transformer processes
         if layer_idx == self.kv_cache.size(0) - 1:
             self.pos = t1
+            
         return key_view, value_view
 
 
@@ -157,15 +179,24 @@ class KVCache:
 def sample_next_token(logits, rng, temperature=1.0, top_k=None):
     """Sample a single next token from given logits of shape (B, vocab_size). Returns (B, 1)."""
     assert temperature >= 0.0, "temperature must be non-negative"
+    
+    # Return the top logit if no temp
     if temperature == 0.0:
         return torch.argmax(logits, dim=-1, keepdim=True)
+    
+    # Return the top k logits if topk
     if top_k is not None:
+        # Select the topK logits BEOFRE temp -> softmax -> sampling
         k = min(top_k, logits.size(-1))
         vals, idx = torch.topk(logits, k, dim=-1)
-        vals = vals / temperature
+        
+        # Dividing the logits by temp before softmax scales the distribution, smooths out the prob dist
+        vals = vals / temperature   
         probs = F.softmax(vals, dim=-1)
         choice = torch.multinomial(probs, num_samples=1, generator=rng)
         return idx.gather(1, choice)
+    
+    # Randomly sample a logit from a multinomial dist based on its softmax score and temp
     else:
         logits = logits / temperature
         probs = F.softmax(logits, dim=-1)
@@ -174,6 +205,11 @@ def sample_next_token(logits, rng, temperature=1.0, top_k=None):
 # -----------------------------------------------------------------------------
 
 class RowState:
+    """
+    Generates a state for each sample so we can track it.
+    
+    Token sequence, queue of tokens, python expression tokens, completed flag.
+    """
     # Per-row state tracking during generation
     def __init__(self, current_tokens=None):
         self.current_tokens = current_tokens or [] # Current token sequence for this row
@@ -198,34 +234,47 @@ class Engine:
 
         # Get the special tokens we need to coordinate the tool use state machine
         get_special = lambda s: self.tokenizer.encode_special(s)
-        python_start = get_special("<|python_start|>")
-        python_end = get_special("<|python_end|>")
-        output_start = get_special("<|output_start|>")
-        output_end = get_special("<|output_end|>")
-        assistant_end = get_special("<|assistant_end|>") # if sampled, ends row
-        bos = self.tokenizer.get_bos_token_id() # if sampled, ends row
+        python_start = get_special("<|python_start|>")      # Assistant starts python code
+        python_end = get_special("<|python_end|>")          # Assistant ends python code
+        output_start = get_special("<|output_start|>")      
+        output_end = get_special("<|output_end|>")          
+        assistant_end = get_special("<|assistant_end|>")    # if sampled, ends row
+        bos = self.tokenizer.get_bos_token_id()             # if sampled, ends row
 
         # 1) Run a batch 1 prefill of the prompt tokens
         m = self.model.config
         kv_model_kwargs = {"num_heads": m.n_kv_head, "head_dim": m.n_embd // m.n_head, "num_layers": m.n_layer}
+        
+        # Initialize a KVCache
         kv_cache_prefill = KVCache(
             batch_size=1,
             seq_len=len(tokens),
             **kv_model_kwargs,
         )
+        
+        # Create a tensor of the tokens
         ids = torch.tensor([tokens], dtype=torch.long, device=device)
+        
+        # Run the model predictions to get the logit next token predictions
         logits = self.model.forward(ids, kv_cache=kv_cache_prefill)
         logits = logits[:, -1, :]
+        
+        # Get the next token predictions for each sample
         next_ids = sample_next_token(logits, rng, temperature, top_k)  # (B, 1)
+        
+        # For each sample, get the top prediction
         sampled_tokens = next_ids[:, 0].tolist()
 
         # 2) Replicate the KV cache for each sample/row
         kv_length_hint = (len(tokens) + max_tokens) if max_tokens is not None else self.model.config.sequence_len
+        
+        # Create a new KVCache of the tokens
         kv_cache_decode = KVCache(
             batch_size=num_samples,
             seq_len=kv_length_hint,
             **kv_model_kwargs,
         )
+        # 
         kv_cache_decode.prefill(kv_cache_prefill)
         del kv_cache_prefill # no need to keep this memory around
 
@@ -300,12 +349,18 @@ class Engine:
         Returns a list of token sequences (list of lists of ints).
         Terminal tokens (assistant_end, bos) are not included in the results.
         """
+        # Track the special tokens that end the generation
         assistant_end = self.tokenizer.encode_special("<|assistant_end|>")
         bos = self.tokenizer.get_bos_token_id()
+        
+        # Copy the input tokens for each sample generated
         results = [tokens.copy() for _ in range(num_samples)]
         masks = [[0] * len(tokens) for _ in range(num_samples)]
         completed = [False] * num_samples
+        
+        # Generate tokens from the previous tokens
         for token_column, token_masks in self.generate(tokens, num_samples, **kwargs):
+            # For each token
             for i, (token, mask) in enumerate(zip(token_column, token_masks)):
                 if not completed[i]:
                     if token == assistant_end or token == bos:
